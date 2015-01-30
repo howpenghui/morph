@@ -1,0 +1,248 @@
+//#include "main.h"
+
+#ifdef WIN32
+#define ssize_t SSIZE_T
+#endif
+
+#include "SimpleImage.h"
+#include "SimpleVideo.h"
+#include "util.h"
+#include "findGL.h"
+#include "findGLUT.h"
+
+#include <vector>
+#include <string>
+#include <iostream>
+#include <sstream>
+#include <fstream>
+#include <string>
+#include <cstdio>
+#include <cmath>
+#include <iomanip>
+#include <memory>
+
+RGBColor WHITE = RGBColor(1.0, 1.0, 1.0);
+int windowHeight;
+int windowWidth;
+
+//parameters - can be adjusted
+const float a = 0.5f;
+const float b = 1.f; 
+const float p = 0.2f;
+
+using namespace std;
+
+typedef unique_ptr<SimpleImage> ImagePtr;
+typedef float (*EasingFunction)(float);
+
+string intermediaryImagesDirectory = "intermediates/";
+string intermediaryImagesBaseName = "intermediate";
+
+vector<Feature> getFeatures(string filename) {
+  int len = filename.length();
+  if(len < 5) {
+    cerr << "Invalid file format. A .feat file required." << endl;
+    exit(1);
+  } else if(filename.substr(len - 5, 5).compare(".feat") != 0){
+    cerr << "Invalid file format. A .feat file is required." << endl;
+    exit(1);        
+  }    
+  string line;
+  ifstream myfile(filename);
+  vector<Feature> f;
+  if(myfile.is_open()) {
+    while(getline(myfile, line)) {
+      istringstream is(line);
+      Vertex2f p, q;
+      is >> p.x >> p.y >> q.x >> q.y;
+      f.push_back(Feature(p*windowHeight, q*windowHeight));
+    }
+  } else {
+    cerr << "Unable to open file." << endl;
+    exit(1);          
+  }
+  return f;
+}
+
+//linear interpolation of 2 colors
+RGBColor lerpColor(RGBColor c1, RGBColor c2, float t){
+  return c1 * (1.f - t) + c2 * t;
+}
+
+RGBColor getColor(const SimpleImage& image, int x, int y){
+  if(x < 0 || x >= windowWidth || y < 0 || y >= windowHeight) {
+    return WHITE;
+  } else {
+    return image(x, y);
+  }
+}
+
+RGBColor bilerpColor(const SimpleImage& image, Vertex2f pixel) {
+  float x = pixel.x, y = pixel.y;
+  double fx = floor(x), fy = floor(y);
+  float s = x - fx, t = y - fy;
+  RGBColor c0 = getColor(image, fx, fy);
+  RGBColor c1 = getColor(image, fx+1, fy);
+  RGBColor c2 = getColor(image, fx, fy+1);
+  RGBColor c3 = getColor(image, fx+1, fy+1);  
+  RGBColor c01 = lerpColor(c0, c1, s);
+  RGBColor c23 = lerpColor(c2, c3, t);
+  return lerpColor(c01, c23, t);
+}
+
+Feature lerpFeature(Feature source, Feature target, float t) {
+  return  source * (1.f - t) + target * t;
+}
+
+Vector2f Perpendicular(Vector2f v) {
+  return Vector2f(v.y, -v.x);
+}
+
+//field morphing
+ImagePtr FieldMorphFixedTime(const SimpleImage& image,
+    vector<Feature> sourceFeatures, vector<Feature> targetFeatures,
+	float a, float b, float p) {
+  int numFeatures = sourceFeatures.size();
+  ImagePtr result(new SimpleImage(windowWidth, windowHeight, WHITE));
+  for(int x = 0; x < windowWidth; ++x) {
+    for(int y = 0; y < windowHeight; ++y) { 
+	  //For each pixel X in the destination
+      Vertex2f DSUM = Vertex2f(0.f, 0.f);
+      float weightsum = 0.f;
+      Vertex2f targetPixel = Vertex2f((float)x, (float)y); //X
+      for(int i = 0; i < numFeatures; ++i) { //for each feature (Pi, Qi)
+        Feature SF = sourceFeatures[i], TF = targetFeatures[i];
+        Vector2f sourceBase = VertToVec(SF.q - SF.p); //Q' - P'
+        float sourceBaseLength = length(sourceBase); //||Q' - P'||                
+        Vector2f targetBase = VertToVec(TF.q - TF.p); //Q - P
+        float targetBaseLength = length(targetBase); //||Q - P||
+        Vector2f targetPerp = Perpendicular(targetBase); //Perpendicular(Q-P)               
+        Vector2f sourcePerp = Perpendicular(sourceBase); //Perpendicular(Q'-P')
+        Vector2f targetElevation = VertToVec(targetPixel - TF.p); //X - P
+        float u = dotProduct(targetElevation, targetBase)
+			/ pow(targetBaseLength,2.f);
+        float v = dotProduct(targetElevation, targetPerp) 
+			/ targetBaseLength;
+        Vertex2f resultingPixel = SF.p + (VecToVert(sourceBase) * u)
+			+ (VecToVert(sourcePerp) * v / sourceBaseLength);
+        Vector2f displacement = VertToVec(resultingPixel - targetPixel); 
+        float dist; //the shortest distance from X to PiQi
+        if(u >= 0 && u <= 1) {
+          dist = abs(v);
+        } else if (u < 0) {
+          dist = Distance(targetPixel, TF.p);
+        } else {
+          dist = Distance(targetPixel, TF.q);
+        }
+        float weight = pow(pow(targetBaseLength, p)/(a+dist), b);
+        DSUM = DSUM + VecToVert(displacement) * weight;
+        weightsum += weight;
+      }
+      Vertex2f sourcePixel = targetPixel + DSUM/weightsum; //X'
+      if(sourcePixel.x >= 0 && sourcePixel.x < windowWidth) {
+        if(sourcePixel.y >= 0 && sourcePixel.y < windowHeight) {
+          result->setPixel(x, y, bilerpColor(image, sourcePixel));
+        }
+      }
+    }
+  }
+  return result;  
+}
+
+ImagePtr FieldMorph(const SimpleImage& image, vector<Feature> sourceFeatures,
+    vector<Feature> targetFeatures, float t, float a, float b, float p) {
+  vector<Feature> intermediateFeatures;
+  int numFeatures = sourceFeatures.size();
+  for(int i = 0; i < numFeatures; ++i) {
+	intermediateFeatures.push_back(
+		lerpFeature(sourceFeatures[i], targetFeatures[i], t));
+  }
+  return FieldMorphFixedTime(image, sourceFeatures, intermediateFeatures, a,
+      b, p);
+}
+
+/* Linear blend of the two images (pixel by pixel) of parameter t 
+   (t from 0 to 1)*/
+ImagePtr LinearBlend(SimpleImage *source, SimpleImage *target, float t) {
+  ImagePtr result(new SimpleImage(windowWidth, windowHeight, WHITE));
+  for(int i = 0; i < windowWidth; ++i) {
+    for(int j = 0; j < windowHeight; ++j) {
+      RGBColor c1 = (*source)(i, j);
+      RGBColor c2 = (*target)(i, j);
+      result->setPixel(i, j, lerpColor(c1, c2, t));
+    }
+  }   
+  return result;
+}
+
+ImagePtr ImageMorph(const SimpleImage& source, const SimpleImage& target,
+    vector<Feature> sourceFeatures, vector<Feature> targetFeatures, float t,
+	float a, float b, float p) {
+  ImagePtr sourceMorphed = FieldMorph(source, sourceFeatures, targetFeatures,
+      t, a, b, p); 
+  ImagePtr targetMorphed = FieldMorph(target, targetFeatures, sourceFeatures,
+      1.f - t, a, b, p);
+  return LinearBlend(sourceMorphed.get(), targetMorphed.get(), t);
+}
+
+//generate the intermediate images
+vector<ImagePtr> MorphFrames(const SimpleImage& sourceImage,
+    const SimpleImage& targetImage, string sourceFilename,
+	string targetFilename, int numFrames, EasingFunction easer) {
+  vector<ImagePtr> ret;
+  vector<Feature> sourceFeatures = getFeatures(sourceFilename);
+  vector<Feature> targetFeatures = getFeatures(targetFilename);
+  for(int i = 0; i < numFrames; ++i) {
+    float t = easer(float(i)/float(numFrames));
+    ImagePtr intermediateImage = ImageMorph(sourceImage, targetImage,
+		sourceFeatures, targetFeatures, t, a ,b, p);
+    string intermediateFilename = intermediaryImagesDirectory 
+		+ intermediaryImagesBaseName 
+		+ (i < 10 ? "0" : "") 
+		+ to_string(i) 
+		+ ".png";
+    intermediateImage->WritePNG(intermediateFilename);
+	ret.push_back(move(intermediateImage));
+  }
+  return ret;
+}
+
+int main(int argc, char** argv) {
+  if(argc < 8) {
+    cerr << "usage: ./imageMorph <source.feat> <target.feat> <source.png> "
+	    << "<target.png> <intermediaryImagesBaseName> <numFrames> "
+		<< "<mode(-l or -s), -l indicates linear and -s indicates "
+		<< "sine curve>" << endl;
+    exit(1);
+  } else if(argc > 8) {
+    cout << "Ignoring excessive arguments..." << endl;
+  } 
+  SimpleImage sourceImage(argv[3]);
+  SimpleImage targetImage(argv[4]);
+  intermediaryImagesBaseName = argv[5];
+  string indicator = argv[7];
+  EasingFunction easer;
+  EasingFunction linear = [] (float fraction) -> float { return fraction; };
+  EasingFunction sinusoidal = [] (float fraction) -> float {
+      return 0.5*((sin(fraction - 0.5)*PI) + 1);
+  };
+
+  if (indicator.compare("-l") == 0) {
+    easer = linear;
+  } else if(indicator.compare("-s") == 0) {
+    easer = sinusoidal;
+  } else {
+    cout << "Invalid mode selected. For now we use LINEAR mode as default."
+        << endl;
+    easer = linear;
+  }	
+
+  windowWidth = max(sourceImage.GetWidth(), targetImage.GetWidth());
+  windowHeight = max(sourceImage.GetHeight(), targetImage.GetHeight());
+
+  vector<ImagePtr> frames = MorphFrames(sourceImage, targetImage, argv[1], 
+      argv[2], atoi(argv[6]), easer);
+  SimpleVideoWriter videoWriter("out.avi", 15, windowWidth, windowHeight);
+  videoWriter.WriteToVideo(frames);
+  return 0;
+}
